@@ -11,10 +11,12 @@ fi
 
 KEY="${RUNPOD_API_KEY:-}"
 if [[ -z "$KEY" ]]; then
-  KEY="$(systemctl show batta-market.service -p Environment --value \
-    | tr " " "\n" \
-    | sed -n "s/^RUNPOD_API_KEY=//p" \
-    | head -1)"
+  PID="$(systemctl show batta-market.service -p MainPID --value)"
+  if [[ -n "$PID" && "$PID" != "0" ]]; then
+    KEY="$(sudo sh -c 'tr "\0" "\n" < /proc/'"$PID"'/environ' \
+      | sed -n "s/^RUNPOD_API_KEY=//p" \
+      | head -1)"
+  fi
 fi
 
 if [[ -z "$KEY" ]]; then
@@ -35,7 +37,7 @@ print(json.dumps({
         "task": "video",
         "prompt": "The person moves naturally, subtle head movement, realistic motion",
         "negative_prompt": "blurry, distorted, low quality",
-        "image_b64": raw,
+        "input_reference_b64": raw,
         "size": "480x480",
         "num_frames": 17,
         "fps": 8,
@@ -78,14 +80,50 @@ for i in $(seq 1 120); do
   R="$(curl -sS \
     -H "Authorization: Bearer $KEY" \
     "https://api.runpod.ai/v2/${ENDPOINT_ID}/status/${JOB_ID}")"
-  echo "$R"
   STATUS="$(python3 -c 'import json,sys
 try:
     print(json.load(sys.stdin).get("status",""))
 except Exception:
     print("")' <<<"$R")"
+
+  echo "status=$STATUS"
+
+  if [[ "$STATUS" == "COMPLETED" ]]; then
+    printf '%s' "$R" > /tmp/omni_last_result.json
+
+    python3 - <<'PY2'
+import base64
+import json
+from pathlib import Path
+
+result = json.loads(Path("/tmp/omni_last_result.json").read_text())
+
+output = result.get("output") or {}
+data_b64 = output.get("data_b64")
+
+if not data_b64:
+    print("COMPLETED but data_b64 not found")
+    print(json.dumps(output, ensure_ascii=False, indent=2)[:4000])
+    raise SystemExit(1)
+
+out = Path("/home/ubuntu/omni_test.mp4")
+out.write_bytes(base64.b64decode(data_b64))
+
+print(f"SAVED: {out}")
+print(f"SIZE: {out.stat().st_size:,} bytes")
+print(f"CONTENT_TYPE: {output.get('content_type')}")
+PY2
+
+    file /home/ubuntu/omni_test.mp4
+    ls -lh /home/ubuntu/omni_test.mp4
+    break
+  fi
+
   case "$STATUS" in
-    COMPLETED|FAILED|CANCELLED|TIMED_OUT) break ;;
+    FAILED|CANCELLED|TIMED_OUT)
+      echo "$R"
+      break
+      ;;
   esac
   sleep 3
 done
